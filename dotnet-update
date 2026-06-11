@@ -1,0 +1,130 @@
+#!/bin/bash
+# Manages .NET under ~/.dotnet. Runtime majors are tracked explicitly: a plain
+# `dotnet-update` only patches what is already installed, never adds or removes
+# a major version.
+#
+#   dotnet-update             update SDK to latest release (single SDK only) and
+#                             update each installed ASP.NET Core runtime major to
+#                             its latest patch; prune superseded versions
+#   dotnet-update add 8.0     start tracking a runtime major
+#   dotnet-update remove 8.0  purge a runtime major
+#
+# Note: the SDK bundles the runtime of its own major, so when a new .NET ships,
+# updating the SDK starts tracking that runtime major too.
+set -euo pipefail
+
+DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
+RELEASES_INDEX="https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json"
+ASPNET_DIR="$DOTNET_ROOT/shared/Microsoft.AspNetCore.App"
+NETCORE_DIR="$DOTNET_ROOT/shared/Microsoft.NETCore.App"
+
+usage() {
+  awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"
+  exit 1
+}
+
+installed_channels() {
+  [ -d "$ASPNET_DIR" ] || return 0
+  ls "$ASPNET_DIR" | cut -d. -f1,2 | sort -unt.
+}
+
+sdk_channel() {
+  [ -d "$DOTNET_ROOT/sdk" ] || return 0
+  ls "$DOTNET_ROOT/sdk" | sort -V | tail -n1 | cut -d. -f1,2
+}
+
+fetch_installer() {
+  installer=$(mktemp)
+  trap 'rm -f "$installer"' EXIT
+  curl -fsSL https://dot.net/v1/dotnet-install.sh -o "$installer"
+  chmod +x "$installer"
+}
+
+install_runtime() {
+  echo "==> ASP.NET Core runtime (channel $1)"
+  "$installer" --runtime aspnetcore --channel "$1" --install-dir "$DOTNET_ROOT" --no-path
+}
+
+remove_versions() {
+  local dir=$1
+  while read -r old; do
+    [ -n "$old" ] || continue
+    echo "    removing ${dir#"$DOTNET_ROOT/"}/$old"
+    rm -rf "${dir:?}/${old:?}"
+  done
+}
+
+# Remove all but the newest version in a directory of versioned subdirs.
+prune_keep_newest() {
+  local dir=$1
+  [ -d "$dir" ] || return 0
+  ls "$dir" | sort -V | sed '$d' | remove_versions "$dir"
+}
+
+# Remove all but the newest version of each major.
+prune_keep_newest_per_major() {
+  local dir=$1 major
+  [ -d "$dir" ] || return 0
+  for major in $(ls "$dir" | cut -d. -f1 | sort -un); do
+    ls "$dir" | grep "^$major\." | sort -V | sed '$d' | remove_versions "$dir"
+  done
+}
+
+cmd_update() {
+  fetch_installer
+
+  # Latest released (non-preview) channel, e.g. "10.0"
+  local latest
+  latest=$(curl -fsSL "$RELEASES_INDEX" | jq -r '
+    [."releases-index"[]
+     | select(."support-phase" | IN("preview", "go-live") | not)
+     | ."channel-version"]
+    | sort_by(split(".") | map(tonumber)) | reverse | .[0]')
+
+  echo "==> SDK (channel $latest)"
+  "$installer" --channel "$latest" --install-dir "$DOTNET_ROOT" --no-path
+
+  local channel
+  for channel in $(installed_channels); do
+    install_runtime "$channel"
+  done
+
+  echo "==> Pruning superseded versions"
+  prune_keep_newest "$DOTNET_ROOT/sdk"
+  prune_keep_newest "$DOTNET_ROOT/host/fxr"
+  prune_keep_newest_per_major "$NETCORE_DIR"
+  prune_keep_newest_per_major "$ASPNET_DIR"
+
+  echo
+  echo "==> Installed SDKs"
+  "$DOTNET_ROOT/dotnet" --list-sdks
+  echo "==> Installed runtimes"
+  "$DOTNET_ROOT/dotnet" --list-runtimes
+}
+
+cmd_add() {
+  local channel=$1
+  fetch_installer
+  install_runtime "$channel"
+}
+
+cmd_remove() {
+  local channel=$1 major=${1%%.*}
+  if [ "$channel" = "$(sdk_channel)" ]; then
+    echo "error: the SDK depends on the $channel runtime; not removing it" >&2
+    exit 1
+  fi
+  if ! ls "$ASPNET_DIR/$major".* >/dev/null 2>&1; then
+    echo "error: no $channel runtime is installed" >&2
+    exit 1
+  fi
+  ls "$ASPNET_DIR" | grep "^$major\." | remove_versions "$ASPNET_DIR"
+  ls "$NETCORE_DIR" | grep "^$major\." | remove_versions "$NETCORE_DIR"
+}
+
+case "${1:-update}" in
+  update) [ $# -le 1 ] || usage; cmd_update ;;
+  add)    [ $# -eq 2 ] || usage; cmd_add "$2" ;;
+  remove) [ $# -eq 2 ] || usage; cmd_remove "$2" ;;
+  *)      usage ;;
+esac
