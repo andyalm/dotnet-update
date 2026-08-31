@@ -45,6 +45,46 @@ install_runtime() {
   "$installer" --runtime aspnetcore --channel "$1" --install-dir "$DOTNET_ROOT" --no-path
 }
 
+# macOS caches a Mach-O's code signature against its inode, and dotnet-install.sh
+# rewrites the muxer in place: it untars into a temp directory, then copies the
+# non-versioned files over the install root with a plain `cp`, which truncates the
+# destination and so keeps its inode. (Versioned directories are skipped when they
+# already exist, so `dotnet` is the only Mach-O a re-install can touch.) If a
+# process still has the old muxer mapped when it is rewritten -- any long-lived
+# dotnet process will do, an IDE or a lingering MSBuild/Roslyn build server -- the
+# kernel keeps checking the new pages against the old signature and SIGKILLs every
+# exec with "Code Signature Invalid", while `codesign -v` still calls the file
+# valid. Copying it through a fresh inode clears the stale cache; processes holding
+# the old inode keep running against it, as they should.
+refresh_muxer_inode() {
+  local muxer="$DOTNET_ROOT/dotnet"
+  [ "$(uname -s)" = Darwin ] || return 0
+  [ -f "$muxer" ] || return 0
+  echo "==> Refreshing the .NET host's inode (macOS code-signature cache)"
+  cp -p "$muxer" "$muxer.new" && mv -f "$muxer.new" "$muxer"
+}
+
+# A poisoned inode only shows up on exec, so confirm the host still runs.
+# --list-sdks rather than --version: --version resolves through any global.json
+# in the current directory and would fail on an unrelated SDK pin.
+verify_host() {
+  local rc=0
+  "$DOTNET_ROOT/dotnet" --list-sdks >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 137 ] && [ "$(uname -s)" = Darwin ]; then
+      echo "error: the .NET host was killed by macOS code-signature validation." >&2
+      echo "       Give the binary a new inode and retry:" >&2
+      echo "       cd $DOTNET_ROOT && cp -p dotnet dotnet.new && mv -f dotnet.new dotnet" >&2
+    elif [ "$rc" -eq 137 ]; then
+      echo "error: $DOTNET_ROOT/dotnet was SIGKILLed; on Linux this is usually" >&2
+      echo "       the OOM killer rather than anything wrong with the install." >&2
+    else
+      echo "error: $DOTNET_ROOT/dotnet failed to run (exit $rc)" >&2
+    fi
+    return 1
+  fi
+}
+
 remove_versions() {
   local dir=$1
   while read -r old; do
@@ -89,6 +129,9 @@ cmd_update() {
     install_runtime "$channel"
   done
 
+  refresh_muxer_inode
+  verify_host
+
   echo "==> Pruning superseded versions"
   prune_keep_newest "$DOTNET_ROOT/sdk"
   prune_keep_newest "$DOTNET_ROOT/host/fxr"
@@ -106,6 +149,8 @@ cmd_add() {
   local channel=$1
   fetch_installer
   install_runtime "$channel"
+  refresh_muxer_inode
+  verify_host
 }
 
 cmd_remove() {
